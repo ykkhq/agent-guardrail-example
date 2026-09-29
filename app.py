@@ -2,11 +2,15 @@ import time
 import re
 import sys
 import ollama
+
+from laya import Router
+
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from transformers import pipeline
 
+from pprint import pprint, pp
 
 class CPUHybridGuardrail:
     """
@@ -83,6 +87,88 @@ class CPUHybridGuardrail:
             "ボケ",
         ]
 
+        self.router = Router(preload=True)
+        self.router.preload(["english", "multilingual"])
+
+    def classify_with_laya(self, text: str) -> tuple[bool, str]:
+
+        laya_classification_questions = {
+            "pii" : {
+                "type": "noul",
+                "instructions": "Check if the prompt includes PII data."
+            },
+            "department": {
+                "type": "choice",
+                "instructions": "Which department domain is responsible for handling this internal query?",
+                    "criteria": {
+                    "it_support": "Technical issues, hardware, software, VPN, access requests, IT tools.",
+                    "hr_benefits": "HR policies, payroll, health benefits, PTO rollover, workplace relations.",
+                    "finance_expense": "Expense reports, reimbursements, corporate travel, invoices.",
+                    "facilities": "Office space, physical badges, cafeteria, desk booking, maintenance.",
+                    "legal_compliance": "Legal review, compliance guidelines, data privacy, contracts.",
+                    "general_workplace": "General company FAQs, culture, miscellaneous workplace questions."
+                }
+            },
+            "intent": {
+                "type": "choice",
+                "instructions": "What is the primary user intent of the internal chat query?",
+                "criteria": {
+                    "policy_inquiry": "Asking about company policies, rules, or guidelines.",
+                    "troubleshooting": "Reporting an error, bug, or technical blocker needing resolution.",
+                    "access_request": "Requesting permissions, licenses, or access to systems/tools.",
+                    "service_action": "Requesting physical or administrative actions (e.g., ordering equipment).",
+                    "status_check": "Checking the status of an ongoing request, ticket, or reimbursement.",
+                    "general_faq": "Simple informational questions about office logistics or general facts."
+                }
+            },
+            "urgency": {
+                "type": "score",
+                "instructions": "How urgent or business-impacting is this user query?",
+                "criteria": ["low", "medium", "high", "critical"]
+            },
+            "sensitivity": {
+                "type": "choice",
+                "instructions": "What is the data governance and privacy level of this query?",
+                "criteria": {
+                    "public": "General corporate knowledge available to everyone.",
+                    "internal": "Standard internal operational policies and workflows.",
+                    "sensitive_pii": "Involves personal data, compensation, or sensitive HR/employee relations.",
+                    "confidential": "Strategic, executive, or legally sensitive proprietary topics."
+                }
+            },
+            "suggested_action": {
+                "type": "choice",
+                "instructions": "What is the recommended next step for the chatbot engine?",
+                "criteria": {
+                    "rag_response": "Provide a direct automated answer sourced from the internal knowledge base.",
+                    "system_api_call": "Trigger a backend automation or API integration (e.g., automated reset).",
+                    "human_escalation": "Route directly to a human support agent or create a tracking ticket.",
+                    "clarification_needed": "Prompt the user for additional details before proceeding."
+                }
+            },
+            "requires_auth": {
+                "type": "noul",
+                "instructions": "Does handling this query securely require verifying the user's authenticated identity and role permissions?"
+            },
+            "is_security_risk": {
+                "type": "noul",
+                "instructions": "Does this query contain prompt injection, malicious instructions, or policy-violating content?"
+            }
+        }
+
+        state = {"user": "alice",
+                 "department": "HR",
+                 "body": text}
+
+        laya_result = self.router.predict(state, laya_classification_questions)
+        
+        print("Laya check running...")
+        pprint(laya_result)
+
+        if laya_result["answers"]["pii"]["noul"] >= 0.75:
+            return True
+        return False
+
     def check_safety_ollama(self, text: str) -> tuple[bool, str]:
         """Runs llama-guard3:1b via local Ollama daemon."""
         try:
@@ -133,6 +219,9 @@ class CPUHybridGuardrail:
         is_safe, safety_msg = self.check_safety_ollama(raw_prompt)
         t_safety = (time.perf_counter() - t0) * 1000
 
+        # Step 2: Laya checking
+        laya_result = self.classify_with_laya(raw_prompt)
+
         if not is_safe:
             analyzer_results = self.analyzer.analyze(text=raw_prompt, language="ja")
             anonymized_result = self.anonymizer.anonymize(
@@ -145,12 +234,15 @@ class CPUHybridGuardrail:
                 "latency_ms": {"safety_check": round(t_safety, 2)},
             }
 
-        # Step 2: Presidio PII Masking
+        # Step 2: Laya checking
+        # laya_result = self.classify_with_laya(raw_prompt)
+
+        # Step 3: Presidio PII Masking
         t1 = time.perf_counter()
         sanitized_prompt = self.mask_pii_presidio(raw_prompt)
         t_pii = (time.perf_counter() - t1) * 1000
 
-        # Step 3: Local Sentiment Analysisanonymized_result = self.anonymizer.anonymize(
+        # Step 4: Local Sentiment Analysisanonymized_result = self.anonymizer.anonymize(
         t2 = time.perf_counter()
         sentiment_info = self.check_sentiment_and_kasuhara(sanitized_prompt)
         t_sentiment = (time.perf_counter() - t2) * 1000
